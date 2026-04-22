@@ -35,7 +35,7 @@ Runtime artifacts (snapshots, generated `.xlsx`) are written under `snapshots/` 
 ## Railway deployment
 
 1. Create a project and deploy from this GitHub repository.
-2. **Do not** rely on committing `.env` — set the same keys in the Railway service **Variables** tab (they become real OS environment variables at runtime).
+2. **Do not** rely on committing `.env` — set the same keys in the Railway service **Variables** tab (they become real OS environment variables at runtime), for example: `QUIVER_API_TOKEN`, `QUIVER_CSRF_TOKEN`, `SENDGRID_API_KEY`, `SENDER_EMAIL`, `RECIPIENT_EMAILS`, and optionally `CC_EMAILS`.
 3. Config-as-code: [`railway.toml`](railway.toml) sets the start command and cron schedule; this overrides dashboard values for deploy settings.
 
 ### Cron schedule
