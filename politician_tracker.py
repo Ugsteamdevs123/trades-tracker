@@ -16,6 +16,7 @@ Configuration (env vars or .env file):
     SENDGRID_API_KEY   — SendGrid API key (SMTP password; username is literal "apikey")
     SENDER_EMAIL       — From address
     RECIPIENT_EMAILS   — Comma-separated recipient list
+    CC_EMAILS          — Optional comma-separated CC addresses
 """
 
 import requests
@@ -72,6 +73,7 @@ SENDGRID_SMTP_USER = "apikey"  # literal; SendGrid SMTP always uses this usernam
 SENDGRID_SMTP_PORT = 587
 SENDER_EMAIL       = os.getenv("SENDER_EMAIL", "")
 RECIPIENT_EMAILS   = [r.strip() for r in os.getenv("RECIPIENT_EMAILS", "").split(",") if r.strip()]
+CC_EMAILS          = [r.strip() for r in os.getenv("CC_EMAILS", "").split(",") if r.strip()]
 
 POLITICIANS  = ["Nancy Pelosi", "Daniel Meuser"]
 SNAPSHOT_DIR = Path("snapshots")
@@ -572,6 +574,8 @@ def send_email_sendgrid(subject_prefix: str, excel_path: Path):
 
     print(f"    From       : {SENDER_EMAIL}")
     print(f"    To         : {', '.join(recipients)}")
+    if CC_EMAILS:
+        print(f"    CC         : {', '.join(CC_EMAILS)}")
     print(f"    Subject    : {subject}")
     print(f"    Attachment : {excel_path.name}  ({excel_path.stat().st_size // 1024} KB)")
 
@@ -583,6 +587,8 @@ def send_email_sendgrid(subject_prefix: str, excel_path: Path):
         msg["Subject"] = subject
         msg["From"]    = SENDER_EMAIL
         msg["To"]      = recipient
+        if CC_EMAILS:
+            msg["Cc"] = ", ".join(CC_EMAILS)
 
         body = MIMEMultipart("alternative")
         body.attach(MIMEText(text_body, "plain"))
@@ -594,11 +600,14 @@ def send_email_sendgrid(subject_prefix: str, excel_path: Path):
         part.add_header("Content-Disposition", "attachment", filename=excel_path.name)
         msg.attach(part)
 
+        envelope = [recipient] + CC_EMAILS
         try:
-            with smtplib.SMTP(SENDGRID_SMTP_HOST, SENDGRID_SMTP_PORT) as server:
+            with smtplib.SMTP(
+                SENDGRID_SMTP_HOST, SENDGRID_SMTP_PORT, timeout=60
+            ) as server:
                 server.ehlo(); server.starttls(); server.ehlo()
                 server.login(SENDGRID_SMTP_USER, SENDGRID_API_KEY)
-                server.sendmail(SENDER_EMAIL, recipient, msg.as_string())
+                server.sendmail(SENDER_EMAIL, envelope, msg.as_string())
             print(f"    ✅ Email successfully sent to: {recipient}")
             logger.info(f"Email sent to {recipient}")
         except smtplib.SMTPAuthenticationError as e:

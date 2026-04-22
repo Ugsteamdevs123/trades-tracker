@@ -28,6 +28,7 @@ python politician_tracker.py --summary
 | `SENDGRID_API_KEY` | SendGrid API key; used as the SMTP password (username is always the literal `apikey`). |
 | `SENDER_EMAIL` | From address; must be a verified sender in SendGrid. |
 | `RECIPIENT_EMAILS` | Comma-separated list of recipient addresses. |
+| `CC_EMAILS`        | Optional comma-separated CC addresses. |
 
 Runtime artifacts (snapshots, generated `.xlsx`) are written under `snapshots/` and are git-ignored.
 
