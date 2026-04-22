@@ -4,8 +4,7 @@ Task 5: Automated Politician Portfolio Tracking & Email Notification System
 =========================================================================
 Fetches congressional trading data from Quiver Quantitative API,
 reconstructs portfolios, detects position changes, generates a styled
-3-sheet Excel report, and sends it as an email attachment via SendGrid SMTP
-(smtplib, no SendGrid SDK).
+3-sheet Excel report, and emails it via the SendGrid HTTP Web API (HTTPS / port 443).
 
 Requirements:
     pip install -r requirements.txt
@@ -13,22 +12,23 @@ Requirements:
 Configuration (env vars or .env file):
     QUIVER_API_TOKEN   — Quiver Quantitative API token
     QUIVER_CSRF_TOKEN  — X-CSRFToken for Quiver API requests
-    SENDGRID_API_KEY   — SendGrid API key (SMTP password; username is literal "apikey")
+    SENDGRID_API_KEY   — SendGrid API key (Bearer token for v3/mail/send)
     SENDER_EMAIL       — From address
-    RECIPIENT_EMAILS   — Comma-separated recipient list
-    CC_EMAILS          — Optional comma-separated CC addresses
+    RECIPIENT_EMAILS   — Comma-separated To addresses
+    CC_EMAILS          — Optional comma-separated CC (omitted in API if empty)
+    BCC_EMAILS         — Optional comma-separated BCC (omitted if empty; deduped vs to/cc)
 """
 
-import requests
-import pandas as pd
-import smtplib
+import base64
 import json
 import os
 import sys
 import logging
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.application import MIMEApplication
+import urllib.error
+import urllib.request
+
+import requests
+import pandas as pd
 from datetime import datetime
 from pathlib import Path
 
@@ -68,14 +68,17 @@ def substep(msg: str):
 QUIVER_API_TOKEN   = os.getenv("QUIVER_API_TOKEN", "")
 QUIVER_CSRF_TOKEN  = os.getenv("QUIVER_CSRF_TOKEN", "")
 SENDGRID_API_KEY   = os.getenv("SENDGRID_API_KEY", "")
-SENDGRID_SMTP_HOST = "smtp.sendgrid.net"
-SENDGRID_SMTP_USER = "apikey"  # literal; SendGrid SMTP always uses this username
-SENDGRID_SMTP_PORT = 587
 SENDER_EMAIL       = os.getenv("SENDER_EMAIL", "")
 RECIPIENT_EMAILS   = [r.strip() for r in os.getenv("RECIPIENT_EMAILS", "").split(",") if r.strip()]
 CC_EMAILS          = [r.strip() for r in os.getenv("CC_EMAILS", "").split(",") if r.strip()]
+BCC_EMAILS         = [r.strip() for r in os.getenv("BCC_EMAILS", "").split(",") if r.strip()]
 
 POLITICIANS  = ["Nancy Pelosi", "Daniel Meuser"]
+
+# Persists the latest reconstructed state per politician, Congress Buys strategy weights,
+# and the generated Excel report under snapshots/ (fixed filenames, overwritten each run—no
+# unbounded growth). For Railway cron, mount this path on a Volume so JSON snapshots survive
+# between container runs; otherwise change detection resets every hour and cannot emit ALERTs.
 SNAPSHOT_DIR = Path("snapshots")
 SNAPSHOT_DIR.mkdir(exist_ok=True)
 
@@ -154,10 +157,13 @@ def get_snapshot_path(name: str) -> Path:
     return SNAPSHOT_DIR / f"{name.replace(' ', '_').lower()}_snapshot.json"
 
 def load_previous_snapshot(name: str) -> dict:
+    # One file per politician: latest run only (no history); compared to current portfolio
+    # for change detection (drives ALERT vs Portfolio Summary email).
     p = get_snapshot_path(name)
     return json.load(open(p)) if p.exists() else {}
 
 def save_snapshot(name: str, portfolio: pd.DataFrame):
+    # Overwrites the same JSON each run; next execution loads it as "previous".
     snapshot = {
         row["Ticker"]: {
             "value": row["EstimatedValue"], "pct": row["PortfolioPct"],
@@ -224,10 +230,12 @@ def get_congress_buys_snapshot_path() -> Path:
     return SNAPSHOT_DIR / "congress_buys_snapshot.json"
 
 def load_congress_buys_snapshot() -> dict:
+    # Latest strategy snapshot only; empty dict on first run (or missing file).
     p = get_congress_buys_snapshot_path()
     return json.load(open(p)) if p.exists() else {}
 
 def save_congress_buys_snapshot(strategy: pd.DataFrame):
+    # Overwrites congress_buys_snapshot.json; used on the next run for change detection.
     snapshot = {
         row["Ticker"]: {
             "pct": row["PortfolioPct"], "amount": row["TotalPurchaseAmount"],
@@ -513,31 +521,67 @@ def generate_excel_report(politician_portfolios: dict,
 
 
 # ============================================================
-# MODULE 5: EMAIL DELIVERY VIA SENDGRID SMTP
+# MODULE 5: EMAIL DELIVERY VIA SENDGRID WEB API
 # ============================================================
+def _dedupe_to_cc_bcc():
+    """Build unique to/cc/bcc lists: same address at most once across all three."""
+    to_order, seen = [], set()
+    for e in RECIPIENT_EMAILS:
+        if not e:
+            continue
+        k = e.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        to_order.append(e)
+    to_lower = {e.lower() for e in to_order}
+    to_list = [{"email": e} for e in to_order]
+
+    cc_deduped, cc_seen = [], set()
+    for e in CC_EMAILS:
+        if not e:
+            continue
+        k = e.lower()
+        if k in to_lower or k in cc_seen:
+            continue
+        cc_seen.add(k)
+        cc_deduped.append(e)
+    cc_list_objs = [{"email": e} for e in cc_deduped]
+    cc_and_to = to_lower | {e.lower() for e in cc_deduped}
+
+    bcc_deduped, bcc_seen = [], set()
+    for e in BCC_EMAILS:
+        if not e:
+            continue
+        k = e.lower()
+        if k in cc_and_to or k in bcc_seen:
+            continue
+        bcc_seen.add(k)
+        bcc_deduped.append(e)
+    bcc_list_objs = [{"email": e} for e in bcc_deduped]
+
+    return to_list, cc_deduped, cc_list_objs, bcc_deduped, bcc_list_objs
+
+
 def send_email_sendgrid(subject_prefix: str, excel_path: Path):
-    """Send a short notification email with the Excel report attached."""
+    """Send report via SendGrid HTTP Web API (HTTPS port 443 — no SMTP). Returns HTTP status or None."""
     if not SENDGRID_API_KEY:
-        print("\n  ⚠  SendGrid API key missing — skipping email send.")
-        return
+        print("\n  ⚠  SENDGRID_API_KEY missing — skipping email send.")
+        return None
 
-    now_str    = datetime.now().strftime("%Y-%m-%d at %H:%M UTC")
-    subject    = f"{subject_prefix} — Congress Portfolio Report — {datetime.now().strftime('%Y-%m-%d')}"
-    recipients = [r.strip() for r in RECIPIENT_EMAILS if r.strip()]
-    if not recipients:
+    if not RECIPIENT_EMAILS:
         print("\n  ⚠  No recipient emails configured — skipping send.")
-        return
+        return None
 
-    text_body = (
-        f"Congressional Portfolio Report\n\n"
-        f"This report was generated on {now_str}.\n\n"
-        f"Please open the attached Excel file to view the full report.\n"
-        f"It contains three sheets:\n"
-        f"  - Nancy Pelosi — individual stock portfolio\n"
-        f"  - Daniel Meuser — individual stock portfolio\n"
-        f"  - Congress Buys Strategy — all holdings weighted by purchase volume\n\n"
-        f"— Automated Politician Portfolio Monitoring System"
-    )
+    to_list, cc_deduped, cc_list_objs, bcc_deduped, bcc_list_objs = _dedupe_to_cc_bcc()
+    if not to_list:
+        print("\n  ⚠  No To addresses after deduplication — skipping send.")
+        return None
+
+    now_str = datetime.now().strftime("%Y-%m-%d at %H:%M UTC")
+    subject = (f"{subject_prefix} — Congress Portfolio Report — "
+               f"{datetime.now().strftime('%Y-%m-%d')}")
+
     html_body = f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"></head>
 <body style="font-family:'Segoe UI',Arial,sans-serif;background:#f5f5f5;margin:0;padding:30px">
@@ -552,73 +596,78 @@ def send_email_sendgrid(subject_prefix: str, excel_path: Path):
     </div>
     <div style="padding:30px">
       <p style="font-size:16px;color:#333;margin-top:0">
-        This report was generated on <strong>{now_str}</strong>.
+        Generated on <strong>{now_str}</strong>.
       </p>
       <p style="font-size:15px;color:#555">
-        Please open the <strong>attached Excel file</strong> to view the full report.
-        It contains three sheets:
+        Open the <strong>attached Excel file</strong> for the full report (3 sheets):
       </p>
       <ul style="color:#555;font-size:15px;line-height:2">
         <li><strong>Nancy Pelosi</strong> — individual stock portfolio</li>
         <li><strong>Daniel Meuser</strong> — individual stock portfolio</li>
-        <li><strong>Congress Buys Strategy</strong> — all holdings weighted by purchase volume</li>
+        <li><strong>Congress Buys Strategy</strong> — weighted by purchase volume</li>
       </ul>
     </div>
     <div style="padding:15px 30px;background:#1a1a2e;color:#888;
                 font-size:11px;text-align:center">
-      Automated Portfolio Tracking System | Powered by Quiver Quantitative API
-      | Delivered via SendGrid
+      Automated Portfolio Tracking System | Quiver Quantitative API | SendGrid
     </div>
   </div>
 </body></html>"""
 
+    personalization = {"to": to_list}
+    if cc_list_objs:
+        personalization["cc"] = cc_list_objs
+    if bcc_list_objs:
+        personalization["bcc"] = bcc_list_objs
+
+    payload = json.dumps({
+        "personalizations": [personalization],
+        "from": {"email": SENDER_EMAIL},
+        "subject": subject,
+        "content": [{"type": "text/html", "value": html_body}],
+        "attachments": [{
+            "content": base64.b64encode(excel_path.read_bytes()).decode(),
+            "type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "filename": excel_path.name,
+            "disposition": "attachment"
+        }]
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.sendgrid.com/v3/mail/send",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {SENDGRID_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST"
+    )
+
     print(f"    From       : {SENDER_EMAIL}")
-    print(f"    To         : {', '.join(recipients)}")
-    if CC_EMAILS:
-        print(f"    CC         : {', '.join(CC_EMAILS)}")
+    to_show = [p["email"] for p in to_list]
+    print(f"    To         : {', '.join(to_show)}")
+    if cc_list_objs:
+        print(f"    CC         : {', '.join(cc_deduped)}")
+    if bcc_list_objs:
+        print(f"    BCC        : {', '.join(bcc_deduped)}")
     print(f"    Subject    : {subject}")
-    print(f"    Attachment : {excel_path.name}  ({excel_path.stat().st_size // 1024} KB)")
+    print(f"    Attachment : {excel_path.name} ({excel_path.stat().st_size // 1024} KB)")
+    print("    Sending via SendGrid Web API (HTTPS)...")
 
-    excel_bytes = excel_path.read_bytes()
-
-    for recipient in recipients:
-        print(f"\n    → Connecting to SendGrid SMTP for: {recipient}")
-        msg            = MIMEMultipart("mixed")
-        msg["Subject"] = subject
-        msg["From"]    = SENDER_EMAIL
-        msg["To"]      = recipient
-        if CC_EMAILS:
-            msg["Cc"] = ", ".join(CC_EMAILS)
-
-        body = MIMEMultipart("alternative")
-        body.attach(MIMEText(text_body, "plain"))
-        body.attach(MIMEText(html_body, "html"))
-        msg.attach(body)
-
-        part = MIMEApplication(excel_bytes,
-               _subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        part.add_header("Content-Disposition", "attachment", filename=excel_path.name)
-        msg.attach(part)
-
-        envelope = [recipient] + CC_EMAILS
-        try:
-            with smtplib.SMTP(
-                SENDGRID_SMTP_HOST, SENDGRID_SMTP_PORT, timeout=60
-            ) as server:
-                server.ehlo(); server.starttls(); server.ehlo()
-                server.login(SENDGRID_SMTP_USER, SENDGRID_API_KEY)
-                server.sendmail(SENDER_EMAIL, envelope, msg.as_string())
-            print(f"    ✅ Email successfully sent to: {recipient}")
-            logger.info(f"Email sent to {recipient}")
-        except smtplib.SMTPAuthenticationError as e:
-            print(f"    ❌ Authentication failed: {e}")
-            logger.error(f"SendGrid auth failed: {e}")
-        except smtplib.SMTPException as e:
-            print(f"    ❌ SMTP error: {e}")
-            logger.error(f"SMTP error: {e}")
-        except Exception as e:
-            print(f"    ❌ Unexpected error: {e}")
-            logger.error(f"Email error: {e}", exc_info=True)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            st = resp.status
+            print(f"    ✅ Email sent — HTTP {st}")
+            logger.info(f"Email sent via SendGrid Web API — HTTP {st}")
+            return st
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        print(f"    ❌ SendGrid API error {e.code}: {body[:300]}")
+        logger.error(f"SendGrid HTTP {e.code}: {body}")
+    except Exception as e:
+        print(f"    ❌ Unexpected error: {e}")
+        logger.error(f"SendGrid error: {e}", exc_info=True)
+    return None
 
 
 # ============================================================
@@ -700,6 +749,9 @@ def run_portfolio_check():
         logger.error(f"Error processing Congress Buys Strategy: {e}", exc_info=True)
 
     # ── Generate Excel + send email ───────────────────────────────────────────
+    run_summary_excel: Path | None = None
+    run_summary_http: int | None = None
+
     if politician_portfolios and cb_strategy is not None:
         subject_prefix = "ALERT: Position Change" if any_changes else "Portfolio Summary"
 
@@ -708,14 +760,29 @@ def run_portfolio_check():
         excel_ok   = generate_excel_report(politician_portfolios, cb_strategy, excel_path)
 
         if excel_ok:
+            run_summary_excel = excel_path
             step("SENDING EMAIL WITH EXCEL ATTACHMENT")
             if any_changes:
                 print("    Position/strategy changes detected — sending ALERT email.")
             else:
                 print("    No changes — sending full PORTFOLIO SUMMARY email.")
-            send_email_sendgrid(subject_prefix, excel_path)
+            run_summary_http = send_email_sendgrid(subject_prefix, excel_path)
         else:
             print("    ⚠  Excel generation failed — email not sent.")
+
+    if run_summary_excel is not None and run_summary_excel.exists():
+        sz = run_summary_excel.stat().st_size
+        print("\n--- Run summary ---")
+        print(f"Report file: {run_summary_excel.resolve()}")
+        print(f"File size: {sz} bytes ({sz // 1024} KB)")
+        if run_summary_http is not None:
+            print(f"SendGrid email: HTTP {run_summary_http}")
+        else:
+            print("SendGrid email: (not sent or failed; see log above)")
+    else:
+        print("\n--- Run summary ---")
+        print("Report file: (no Excel written this run)")
+        print("SendGrid email: n/a")
 
     print("\n" + "█" * 60)
     print("  PORTFOLIO CHECK COMPLETE")
