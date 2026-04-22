@@ -1,0 +1,4 @@
+[deploy]
+startCommand = "python politician_tracker.py"
+cronSchedule = "0 * * * *"
+restartPolicyType = "NEVER"
