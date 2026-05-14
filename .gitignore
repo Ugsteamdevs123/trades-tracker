@@ -4,6 +4,7 @@
 # Runtime data
 snapshots/
 *.xlsx
+*.pdf
 
 # Python cache
 __pycache__/

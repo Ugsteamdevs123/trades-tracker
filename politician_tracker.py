@@ -3,8 +3,16 @@
 Task 5: Automated Politician Portfolio Tracking & Email Notification System
 =========================================================================
 Fetches congressional trading data from Quiver Quantitative API,
-reconstructs portfolios, detects position changes, generates a styled
-3-sheet Excel report, and emails it via the SendGrid HTTP Web API (HTTPS / port 443).
+reconstructs portfolios, detects position changes, generates PDF reports
+(full portfolio and change-only), and emails via the SendGrid HTTP Web API
+(HTTPS / port 443). Change alerts are suppressed on bootstrap (no prior
+snapshot). A daily digest email is sent at most once per UTC day after
+DAILY_DIGEST_HOUR_UTC; use ``python politician_tracker.py --digest`` for a
+standalone digest job on Railway. Use ``python politician_tracker.py --pdf-only``
+to write full + changes PDFs from live data without sending email.
+Use ``python politician_tracker.py --reset-snapshots`` to archive and remove
+saved JSON snapshots, then run a PDF-only pass so the changes PDF lists the
+full bootstrap diff; new snapshots are written at the end for future runs.
 
 Requirements:
     pip install -r requirements.txt
@@ -17,11 +25,14 @@ Configuration (env vars or .env file):
     RECIPIENT_EMAILS   — Comma-separated To addresses
     CC_EMAILS          — Optional comma-separated CC (omitted in API if empty)
     BCC_EMAILS         — Optional comma-separated BCC (omitted if empty; deduped vs to/cc)
+    DAILY_DIGEST_HOUR_UTC — Hour (0–23) after which the main cron may send the daily
+                        digest if not already sent that UTC date (default: 8).
 """
 
 import base64
 import json
 import os
+import shutil
 import sys
 import logging
 import urllib.error
@@ -29,12 +40,10 @@ import urllib.request
 
 import requests
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+from pdf_report import build_changes_pdf, build_full_portfolio_pdf
 
 try:
     from dotenv import load_dotenv
@@ -75,12 +84,18 @@ BCC_EMAILS         = [r.strip() for r in os.getenv("BCC_EMAILS", "").split(",") 
 
 POLITICIANS  = ["Nancy Pelosi", "Daniel Meuser"]
 
-# Persists the latest reconstructed state per politician, Congress Buys strategy weights,
-# and the generated Excel report under snapshots/ (fixed filenames, overwritten each run—no
-# unbounded growth). For Railway cron, mount this path on a Volume so JSON snapshots survive
-# between container runs; otherwise change detection resets every hour and cannot emit ALERTs.
+# Persists JSON snapshots, digest sentinel, and generated PDFs under snapshots/ (fixed
+# filenames, overwritten each run). Mount on a Railway Volume so change detection and the
+# daily digest gate survive between cron runs.
 SNAPSHOT_DIR = Path("snapshots")
 SNAPSHOT_DIR.mkdir(exist_ok=True)
+PDF_FULL_PATH = SNAPSHOT_DIR / "congress_portfolio_full.pdf"
+PDF_CHANGES_PATH = SNAPSHOT_DIR / "congress_portfolio_changes.pdf"
+LAST_DIGEST_PATH = SNAPSHOT_DIR / "last_digest_date.txt"
+DAILY_DIGEST_HOUR_UTC = int(os.getenv("DAILY_DIGEST_HOUR_UTC", "8"))
+# When using a separate Railway cron with ``python politician_tracker.py --digest``, set
+# SKIP_DIGEST_IN_MAIN_CRON=1 on the frequent-check service to avoid duplicate digest emails.
+SKIP_DIGEST_IN_MAIN_CRON = os.getenv("SKIP_DIGEST_IN_MAIN_CRON", "").lower() in ("1", "true", "yes")
 
 RANGE_MIDPOINTS = {
     1.0: 500, 9.0: 5000, 15.0: 7500, 1001.0: 8000,
@@ -156,9 +171,34 @@ def reconstruct_portfolio(df: pd.DataFrame) -> pd.DataFrame:
 def get_snapshot_path(name: str) -> Path:
     return SNAPSHOT_DIR / f"{name.replace(' ', '_').lower()}_snapshot.json"
 
+
+def archive_and_remove_snapshots() -> None:
+    """
+    Copy politician + Congress Buys JSON snapshots into snapshots/archive/<ts>/
+    then delete the live files. Next portfolio run compares against empty state
+    (bootstrap), then saves fresh snapshots.
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    arch = SNAPSHOT_DIR / "archive" / f"pre_reset_{ts}"
+    arch.mkdir(parents=True, exist_ok=True)
+    paths = [get_snapshot_path(n) for n in POLITICIANS] + [get_congress_buys_snapshot_path()]
+    copied = 0
+    for p in paths:
+        if not p.exists():
+            continue
+        dest = arch / p.name
+        shutil.copy2(p, dest)
+        p.unlink()
+        copied += 1
+        print(f"    ✔  Archived + removed → {p.name} (backup: {dest})")
+    if copied == 0:
+        print("    ✔  No prior snapshot JSON files found — starting from empty state.")
+    else:
+        print(f"    Snapshot backup directory: {arch.resolve()}")
+
 def load_previous_snapshot(name: str) -> dict:
     # One file per politician: latest run only (no history); compared to current portfolio
-    # for change detection (drives ALERT vs Portfolio Summary email).
+    # for change detection (drives change-alert PDF when a prior non-empty snapshot exists).
     p = get_snapshot_path(name)
     return json.load(open(p)) if p.exists() else {}
 
@@ -175,6 +215,12 @@ def save_snapshot(name: str, portfolio: pd.DataFrame):
     json.dump(snapshot, open(get_snapshot_path(name), "w"), indent=2)
     substep(f"Snapshot saved → {get_snapshot_path(name)}")
 
+def _portfolio_row_last_trade_date(row) -> str | None:
+    if pd.notna(row.get("LastTradeDate")):
+        return row["LastTradeDate"].strftime("%Y-%m-%d")
+    return None
+
+
 def detect_changes(name: str, portfolio: pd.DataFrame) -> list:
     previous = load_previous_snapshot(name)
     curr, prev = set(portfolio["Ticker"]), set(previous)
@@ -182,16 +228,22 @@ def detect_changes(name: str, portfolio: pd.DataFrame) -> list:
     for t in curr - prev:
         row = portfolio[portfolio["Ticker"] == t].iloc[0]
         changes.append({"ticker": t, "type": "NEW POSITION",
-                        "old_pct": 0, "new_pct": row["PortfolioPct"], "value": row["EstimatedValue"]})
+                        "old_pct": 0, "new_pct": row["PortfolioPct"], "value": row["EstimatedValue"],
+                        "date": _portfolio_row_last_trade_date(row)})
     for t in prev - curr:
+        prev_row = previous[t]
+        closed_d = prev_row.get("last_date")
+        d = closed_d if isinstance(closed_d, str) and closed_d != "N/A" else None
         changes.append({"ticker": t, "type": "POSITION CLOSED",
-                        "old_pct": previous[t]["pct"], "new_pct": 0, "value": 0})
+                        "old_pct": prev_row["pct"], "new_pct": 0, "value": 0,
+                        "date": d})
     for t in curr & prev:
         row = portfolio[portfolio["Ticker"] == t].iloc[0]
         old, new = previous[t]["pct"], row["PortfolioPct"]
         if abs(new - old) >= 0.5:
             changes.append({"ticker": t, "type": "INCREASED" if new > old else "DECREASED",
-                            "old_pct": old, "new_pct": new, "value": row["EstimatedValue"]})
+                            "old_pct": old, "new_pct": new, "value": row["EstimatedValue"],
+                            "date": _portfolio_row_last_trade_date(row)})
     return changes
 
 
@@ -248,6 +300,12 @@ def save_congress_buys_snapshot(strategy: pd.DataFrame):
     json.dump(snapshot, open(get_congress_buys_snapshot_path(), "w"), indent=2)
     substep(f"Congress Buys snapshot saved → {get_congress_buys_snapshot_path()}")
 
+def _cb_strategy_last_buy_date(row) -> str | None:
+    if pd.notna(row.get("LastPurchaseDate")):
+        return pd.to_datetime(row["LastPurchaseDate"]).strftime("%Y-%m-%d")
+    return None
+
+
 def detect_congress_buys_changes(strategy: pd.DataFrame) -> list:
     previous = load_congress_buys_snapshot()
     curr, prev = set(strategy["Ticker"]), set(previous)
@@ -255,269 +313,72 @@ def detect_congress_buys_changes(strategy: pd.DataFrame) -> list:
     for t in curr - prev:
         row = strategy[strategy["Ticker"] == t].iloc[0]
         changes.append({"ticker": t, "type": "NEW IN STRATEGY",
-                        "old_pct": 0.0, "new_pct": row["PortfolioPct"]})
+                        "old_pct": 0.0, "new_pct": row["PortfolioPct"],
+                        "date": _cb_strategy_last_buy_date(row)})
     for t in prev - curr:
+        prev_row = previous.get(t) or {}
+        ld = prev_row.get("last_date")
+        d = ld if isinstance(ld, str) and ld != "N/A" else None
         changes.append({"ticker": t, "type": "DROPPED FROM STRATEGY",
-                        "old_pct": previous[t]["pct"], "new_pct": 0.0})
+                        "old_pct": previous[t]["pct"], "new_pct": 0.0, "date": d})
     for t in curr & prev:
         row = strategy[strategy["Ticker"] == t].iloc[0]
         old, new = previous[t]["pct"], row["PortfolioPct"]
         if abs(new - old) >= 0.5:
             changes.append({"ticker": t,
                             "type": "WEIGHT INCREASED" if new > old else "WEIGHT DECREASED",
-                            "old_pct": old, "new_pct": new})
+                            "old_pct": old, "new_pct": new,
+                            "date": _cb_strategy_last_buy_date(row)})
     return changes
 
 
-# ============================================================
-# MODULE 4: EXCEL REPORT GENERATION (3 sheets)
-# ============================================================
-DARK_NAVY   = "1A1A2E"
-MID_NAVY    = "16213E"
-ACCENT_BLUE = "0F3460"
-CONGRESS_BG = "0F4C75"
-BUY_GREEN   = "27AE60"
-SELL_RED    = "E74C3C"
-LIGHT_GRAY  = "F8F9FA"
-ALT_ROW     = "EEF2F7"
-HEADER_GOLD = "E8C96A"
-
-def _thin_border():
-    s = Side(style="thin", color="CCCCCC")
-    return Border(left=s, right=s, top=s, bottom=s)
-
-def _fill(hex_color):
-    return PatternFill("solid", fgColor=hex_color)
-
-def _font(size=10, bold=False, color="333333"):
-    return Font(name="Arial", size=size, bold=bold, color=color)
-
-def _center():
-    return Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-def _left():
-    return Alignment(horizontal="left", vertical="center", wrap_text=True)
-
-
-def _write_title(ws, title, subtitle, generated_at, ncols):
-    ws.row_dimensions[1].height = 36
-    ws.merge_cells(f"A1:{get_column_letter(ncols)}1")
-    c = ws["A1"]
-    c.value = title
-    c.font  = Font(name="Arial", size=16, bold=True, color="FFFFFF")
-    c.fill  = _fill(DARK_NAVY)
-    c.alignment = _center()
-
-    ws.row_dimensions[2].height = 22
-    ws.merge_cells(f"A2:{get_column_letter(ncols)}2")
-    c = ws["A2"]
-    c.value = f"{subtitle}   |   Generated: {generated_at}"
-    c.font  = Font(name="Arial", size=10, color="AAAAAA")
-    c.fill  = _fill(MID_NAVY)
-    c.alignment = _center()
-
-    ws.row_dimensions[3].height = 6
-    ws.merge_cells(f"A3:{get_column_letter(ncols)}3")
-    ws["A3"].fill = _fill("F0F4F8")
-
-
-def _write_info_bar(ws, row, text, ncols, bg="E8F0FE"):
-    ws.row_dimensions[row].height = 20
-    ws.merge_cells(f"A{row}:{get_column_letter(ncols)}{row}")
-    c = ws[f"A{row}"]
-    c.value = text
-    c.font  = Font(name="Arial", size=10, bold=True, color=DARK_NAVY)
-    c.fill  = _fill(bg)
-    c.alignment = _left()
-    c.border = _thin_border()
-
-
-def _write_col_headers(ws, row, headers, bg=DARK_NAVY):
-    ws.row_dimensions[row].height = 30
-    for col, hdr in enumerate(headers, 1):
-        c = ws.cell(row=row, column=col, value=hdr)
-        c.font      = Font(name="Arial", size=10, bold=True, color="FFFFFF")
-        c.fill      = _fill(bg)
-        c.alignment = _center()
-        c.border    = _thin_border()
-
-
-def _write_totals_row(ws, row, ncols, value_col, bg=DARK_NAVY):
-    ws.row_dimensions[row].height = 22
-    for col in range(1, ncols + 1):
-        c = ws.cell(row=row, column=col)
-        c.fill = _fill(bg); c.border = _thin_border()
-    ws.cell(row=row, column=1).value     = "TOTAL"
-    ws.cell(row=row, column=1).font      = Font(name="Arial", size=10, bold=True, color="FFFFFF")
-    ws.cell(row=row, column=1).alignment = _center()
-    c = ws.cell(row=row, column=value_col,
-                value=f"=SUM({get_column_letter(value_col)}6:{get_column_letter(value_col)}{row-1})")
-    c.number_format = '$#,##0'
-    c.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
-    c.alignment = _center()
-    c2 = ws.cell(row=row, column=value_col + 1, value=1.0)
-    c2.number_format = '0.00%'
-    c2.font = Font(name="Arial", size=10, bold=True, color=HEADER_GOLD)
-    c2.alignment = _center()
-
-
-def _write_disclaimer(ws, row, text, ncols=8):
-    ws.merge_cells(f"A{row}:{get_column_letter(ncols)}{row}")
-    c = ws[f"A{row}"]
-    c.value = text
-    c.font  = Font(name="Arial", size=8, italic=True, color="888888")
-    c.alignment = _left()
-
-
-def build_politician_sheet(wb: Workbook, sheet_name: str, politician_name: str,
-                            party: str, chamber: str, portfolio: pd.DataFrame):
-    ws  = wb.create_sheet(title=sheet_name)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
-
-    for i, w in enumerate([8, 38, 18, 16, 16, 20], 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-    _write_title(ws, f"{politician_name} — Stock Portfolio",
-                 f"{party}  |  {chamber}", now, ncols=6)
-
-    total_val = portfolio["EstimatedValue"].sum()
-    _write_info_bar(ws, 4,
-        f"Total Estimated Portfolio Value:   ${total_val:,.0f}   |   "
-        f"Open Positions: {len(portfolio)}", ncols=6)
-
-    _write_col_headers(ws, 5,
-        ["Ticker", "Stock Name", "Est. Value ($)", "% of Portfolio",
-         "Last Action", "Last Trade Date"])
-
-    for i, (_, row) in enumerate(portfolio.iterrows()):
-        r  = i + 6
-        bg = LIGHT_GRAY if i % 2 == 0 else ALT_ROW
-        ws.row_dimensions[r].height = 18
-
-        c = ws.cell(row=r, column=1, value=row["Ticker"])
-        c.font = Font(name="Arial", size=10, bold=True, color=ACCENT_BLUE)
-        c.fill = _fill(bg); c.alignment = _center(); c.border = _thin_border()
-
-        c = ws.cell(row=r, column=2, value=row["StockName"])
-        c.font = _font(); c.fill = _fill(bg); c.alignment = _left(); c.border = _thin_border()
-
-        c = ws.cell(row=r, column=3, value=row["EstimatedValue"])
-        c.number_format = '$#,##0'
-        c.font = _font(bold=True); c.fill = _fill(bg); c.alignment = _center(); c.border = _thin_border()
-
-        c = ws.cell(row=r, column=4, value=row["PortfolioPct"] / 100)
-        c.number_format = '0.00%'
-        c.font = _font(); c.fill = _fill(bg); c.alignment = _center(); c.border = _thin_border()
-
-        action = row["LastAction"]
-        c = ws.cell(row=r, column=5, value=action)
-        c.font = Font(name="Arial", size=10, bold=True,
-                      color=BUY_GREEN if action == "Purchase" else SELL_RED)
-        c.fill = _fill(bg); c.alignment = _center(); c.border = _thin_border()
-
-        date_str = row["LastTradeDate"].strftime("%Y-%m-%d") \
-            if pd.notna(row["LastTradeDate"]) else "N/A"
-        c = ws.cell(row=r, column=6, value=date_str)
-        c.font = _font(); c.fill = _fill(bg); c.alignment = _center(); c.border = _thin_border()
-
-    total_row = len(portfolio) + 6
-    _write_totals_row(ws, total_row, ncols=6, value_col=3)
-    ws.freeze_panes = "A6"
-    _write_disclaimer(ws, total_row + 2,
-        "⚠  Data sourced from STOCK Act congressional financial disclosure filings via "
-        "Quiver Quantitative API. Values are estimates based on disclosed dollar ranges. "
-        "Not investment advice.", ncols=6)
-
-
-def build_congress_sheet(wb: Workbook, strategy: pd.DataFrame):
-    ws  = wb.create_sheet(title="Congress Buys Strategy")
-    now = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
-
-    for i, w in enumerate([8, 38, 22, 16, 12, 16, 20], 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-    _write_title(ws,
-        "Congress Buys Strategy — All Holdings",
-        "All U.S. Congress Members  |  Weighted by Purchase Size  |  Rolling 12-Month Window",
-        now, ncols=7)
-
-    total_vol = strategy["TotalPurchaseAmount"].sum()
-    _write_info_bar(ws, 4,
-        f"Total Purchase Volume Tracked: ${total_vol:,.0f} (est.)   |   "
-        f"Holdings: {len(strategy)}   |   "
-        f"Strategy CAGR (Quiver backtest since 2020-04-01): 33.01%",
-        ncols=7, bg="E0F0FF")
-
-    _write_col_headers(ws, 5,
-        ["Ticker", "Stock Name", "Est. Purchase Vol. ($)", "% of Strategy",
-         "# Trades", "# Members", "Last Buy Date"],
-        bg=CONGRESS_BG)
-
-    for i, (_, row) in enumerate(strategy.iterrows()):
-        r  = i + 6
-        bg = LIGHT_GRAY if i % 2 == 0 else ALT_ROW
-        ws.row_dimensions[r].height = 18
-
-        c = ws.cell(row=r, column=1, value=row["Ticker"])
-        c.font = Font(name="Arial", size=10, bold=True, color=CONGRESS_BG)
-        c.fill = _fill(bg); c.alignment = _center(); c.border = _thin_border()
-
-        c = ws.cell(row=r, column=2, value=row.get("StockName", ""))
-        c.font = _font(); c.fill = _fill(bg); c.alignment = _left(); c.border = _thin_border()
-
-        c = ws.cell(row=r, column=3, value=row["TotalPurchaseAmount"])
-        c.number_format = '$#,##0'
-        c.font = _font(bold=True); c.fill = _fill(bg); c.alignment = _center(); c.border = _thin_border()
-
-        c = ws.cell(row=r, column=4, value=row["PortfolioPct"] / 100)
-        c.number_format = '0.00%'
-        c.font = _font(); c.fill = _fill(bg); c.alignment = _center(); c.border = _thin_border()
-
-        c = ws.cell(row=r, column=5, value=int(row["TradeCount"]))
-        c.font = _font(); c.fill = _fill(bg); c.alignment = _center(); c.border = _thin_border()
-
-        c = ws.cell(row=r, column=6, value=int(row["UniqueMembers"]))
-        c.font = _font(); c.fill = _fill(bg); c.alignment = _center(); c.border = _thin_border()
-
-        date_str = pd.to_datetime(row["LastPurchaseDate"]).strftime("%Y-%m-%d") \
-            if pd.notna(row["LastPurchaseDate"]) else "N/A"
-        c = ws.cell(row=r, column=7, value=date_str)
-        c.font = _font(); c.fill = _fill(bg); c.alignment = _center(); c.border = _thin_border()
-
-    total_row = len(strategy) + 6
-    _write_totals_row(ws, total_row, ncols=7, value_col=3, bg=CONGRESS_BG)
-    ws.freeze_panes = "A6"
-    _write_disclaimer(ws, total_row + 2,
-        "⚠  Data sourced from STOCK Act filings via Quiver Quantitative API. "
-        "Quiver-reported CAGR of 33.01% based on backtest from 2020-04-01. "
-        "Past performance does not guarantee future results. Not investment advice.", ncols=7)
-
-
-def generate_excel_report(politician_portfolios: dict,
-                           congress_strategy: pd.DataFrame,
-                           excel_path: Path) -> bool:
-    """Build the 3-sheet Excel workbook and save it to excel_path."""
-    try:
-        wb = Workbook()
-        wb.remove(wb.active)  # remove default blank sheet
-
-        for name, portfolio in politician_portfolios.items():
-            meta = POLITICIAN_META.get(name, {"party": "Unknown", "chamber": "Unknown"})
-            build_politician_sheet(wb, name, name, meta["party"], meta["chamber"], portfolio)
-            substep(f"Sheet '{name}' written — {len(portfolio)} positions")
-
-        build_congress_sheet(wb, congress_strategy)
-        substep(f"Sheet 'Congress Buys Strategy' written — {len(congress_strategy)} holdings")
-
-        wb.save(str(excel_path))
-        size_kb = excel_path.stat().st_size // 1024
-        print(f"    ✅ Excel report saved → {excel_path.resolve()}  ({size_kb} KB)")
-        logger.info(f"Excel report saved at {excel_path}")
-        return True
-    except Exception as e:
-        print(f"    ❌ Excel generation failed: {e}")
-        logger.error(f"Excel generation error: {e}", exc_info=True)
+def has_prior_politician_snapshot(name: str) -> bool:
+    """True if a non-empty JSON snapshot exists (bootstrap runs skip change alerts)."""
+    p = get_snapshot_path(name)
+    if not p.exists():
         return False
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        return isinstance(data, dict) and len(data) > 0
+    except (json.JSONDecodeError, OSError):
+        return False
+
+
+def has_prior_congress_buys_snapshot() -> bool:
+    p = get_congress_buys_snapshot_path()
+    if not p.exists():
+        return False
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        return isinstance(data, dict) and len(data) > 0
+    except (json.JSONDecodeError, OSError):
+        return False
+
+
+def should_send_daily_digest(now_utc: datetime) -> bool:
+    if SKIP_DIGEST_IN_MAIN_CRON:
+        return False
+    if now_utc.hour < DAILY_DIGEST_HOUR_UTC:
+        return False
+    today = now_utc.strftime("%Y-%m-%d")
+    if not LAST_DIGEST_PATH.exists():
+        return True
+    try:
+        last = LAST_DIGEST_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return True
+    return last != today
+
+
+def mark_digest_sent(date_iso: str):
+    LAST_DIGEST_PATH.write_text(date_iso + "\n", encoding="utf-8")
+
+
+# ============================================================
+# MODULE 4: PDF reports (see pdf_report.py)
+# ============================================================
 
 
 # ============================================================
@@ -563,8 +424,8 @@ def _dedupe_to_cc_bcc():
     return to_list, cc_deduped, cc_list_objs, bcc_deduped, bcc_list_objs
 
 
-def send_email_sendgrid(subject_prefix: str, excel_path: Path):
-    """Send report via SendGrid HTTP Web API (HTTPS port 443 — no SMTP). Returns HTTP status or None."""
+def send_email_sendgrid_pdf(subject: str, html_body: str, pdf_path: Path):
+    """Send one PDF attachment via SendGrid Web API (HTTPS port 443). Returns HTTP status or None."""
     if not SENDGRID_API_KEY:
         print("\n  ⚠  SENDGRID_API_KEY missing — skipping email send.")
         return None
@@ -578,42 +439,6 @@ def send_email_sendgrid(subject_prefix: str, excel_path: Path):
         print("\n  ⚠  No To addresses after deduplication — skipping send.")
         return None
 
-    now_str = datetime.now().strftime("%Y-%m-%d at %H:%M UTC")
-    subject = (f"{subject_prefix} — Congress Portfolio Report — "
-               f"{datetime.now().strftime('%Y-%m-%d')}")
-
-    html_body = f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"></head>
-<body style="font-family:'Segoe UI',Arial,sans-serif;background:#f5f5f5;margin:0;padding:30px">
-  <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:8px;
-              overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,0.1)">
-    <div style="background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);
-                color:#fff;padding:30px">
-      <h1 style="margin:0;font-size:22px">{subject_prefix}</h1>
-      <p style="margin:8px 0 0;opacity:0.8;font-size:13px">
-        Automated Politician Portfolio Monitoring System
-      </p>
-    </div>
-    <div style="padding:30px">
-      <p style="font-size:16px;color:#333;margin-top:0">
-        Generated on <strong>{now_str}</strong>.
-      </p>
-      <p style="font-size:15px;color:#555">
-        Open the <strong>attached Excel file</strong> for the full report (3 sheets):
-      </p>
-      <ul style="color:#555;font-size:15px;line-height:2">
-        <li><strong>Nancy Pelosi</strong> — individual stock portfolio</li>
-        <li><strong>Daniel Meuser</strong> — individual stock portfolio</li>
-        <li><strong>Congress Buys Strategy</strong> — weighted by purchase volume</li>
-      </ul>
-    </div>
-    <div style="padding:15px 30px;background:#1a1a2e;color:#888;
-                font-size:11px;text-align:center">
-      Automated Portfolio Tracking System | Quiver Quantitative API | SendGrid
-    </div>
-  </div>
-</body></html>"""
-
     personalization = {"to": to_list}
     if cc_list_objs:
         personalization["cc"] = cc_list_objs
@@ -626,9 +451,9 @@ def send_email_sendgrid(subject_prefix: str, excel_path: Path):
         "subject": subject,
         "content": [{"type": "text/html", "value": html_body}],
         "attachments": [{
-            "content": base64.b64encode(excel_path.read_bytes()).decode(),
-            "type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "filename": excel_path.name,
+            "content": base64.b64encode(pdf_path.read_bytes()).decode(),
+            "type": "application/pdf",
+            "filename": pdf_path.name,
             "disposition": "attachment"
         }]
     }).encode("utf-8")
@@ -651,7 +476,7 @@ def send_email_sendgrid(subject_prefix: str, excel_path: Path):
     if bcc_list_objs:
         print(f"    BCC        : {', '.join(bcc_deduped)}")
     print(f"    Subject    : {subject}")
-    print(f"    Attachment : {excel_path.name} ({excel_path.stat().st_size // 1024} KB)")
+    print(f"    Attachment : {pdf_path.name} ({pdf_path.stat().st_size // 1024} KB)")
     print("    Sending via SendGrid Web API (HTTPS)...")
 
     try:
@@ -673,15 +498,43 @@ def send_email_sendgrid(subject_prefix: str, excel_path: Path):
 # ============================================================
 # MAIN ORCHESTRATION
 # ============================================================
-def run_portfolio_check():
+def _html_email_shell(title: str, inner_html: str) -> str:
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"></head>
+<body style="font-family:'Segoe UI',Arial,sans-serif;background:#f5f5f5;margin:0;padding:30px">
+  <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:8px;
+              overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,0.1)">
+    <div style="background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);
+                color:#fff;padding:30px">
+      <h1 style="margin:0;font-size:22px">{title}</h1>
+      <p style="margin:8px 0 0;opacity:0.8;font-size:13px">
+        Automated Politician Portfolio Monitoring System
+      </p>
+    </div>
+    <div style="padding:30px">
+{inner_html}
+    </div>
+    <div style="padding:15px 30px;background:#1a1a2e;color:#888;
+                font-size:11px;text-align:center">
+      Automated Portfolio Tracking System | Quiver Quantitative API | SendGrid
+    </div>
+  </div>
+</body></html>"""
+
+
+def run_portfolio_check(pdf_export: bool = False):
     _STEP_COUNTER[0] = 0
     print("\n" + "█" * 60)
     print("  POLITICIAN PORTFOLIO TRACKING SYSTEM — STARTING RUN")
+    if pdf_export:
+        print("  (mode: --pdf-only — write PDFs only, no email)")
     print("  " + datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"))
     print("█" * 60)
 
-    politician_portfolios = {}
-    any_changes = False
+    politician_portfolios: dict = {}
+    change_sections: list[tuple[str, list]] = []
+    change_sections_export: list[tuple[str, list]] = []
+    any_alert = False
 
     # ── Individual politician portfolios ─────────────────────────────────────
     for politician in POLITICIANS:
@@ -698,14 +551,21 @@ def run_portfolio_check():
 
             substep(f"Portfolio reconstructed — {len(portfolio)} open positions")
 
+            prior_pol = has_prior_politician_snapshot(politician)
             print("    Detecting position changes vs. last snapshot...")
             changes = detect_changes(politician, portfolio)
             if changes:
-                any_changes = True
                 print(f"    ⚠  {len(changes)} change(s) detected:")
                 for c in changes:
                     print(f"         {c['ticker']:6s}  {c['type']}  "
                           f"{c['old_pct']:.2f}% → {c['new_pct']:.2f}%")
+                if prior_pol:
+                    any_alert = True
+                    change_sections.append((politician, changes))
+                else:
+                    print("    (No prior snapshot — bootstrap; no alert email for these rows.)")
+                if pdf_export:
+                    change_sections_export.append((politician, changes))
             else:
                 substep(f"No portfolio changes detected for {politician}")
 
@@ -730,14 +590,21 @@ def run_portfolio_check():
         cb_strategy = compute_congress_buys_strategy(cb_trades)
         substep(f"Congress Buys strategy computed — {len(cb_strategy)} holdings")
 
+        prior_cb = has_prior_congress_buys_snapshot()
         print("    Detecting Congress Buys strategy changes...")
         cb_changes = detect_congress_buys_changes(cb_strategy)
         if cb_changes:
-            any_changes = True
             print(f"    ⚠  {len(cb_changes)} strategy change(s) detected:")
             for c in cb_changes:
                 print(f"         {c['ticker']:6s}  {c['type']}  "
                       f"{c['old_pct']:.2f}% → {c['new_pct']:.2f}%")
+            if prior_cb:
+                any_alert = True
+                change_sections.append(("Congress Buys Strategy", cb_changes))
+            else:
+                print("    (No prior Congress Buys snapshot — bootstrap; no alert email.)")
+            if pdf_export:
+                change_sections_export.append(("Congress Buys Strategy", cb_changes))
         else:
             substep("No strategy changes detected")
 
@@ -748,41 +615,127 @@ def run_portfolio_check():
         print(f"    ❌ Error processing Congress Buys Strategy: {e}")
         logger.error(f"Error processing Congress Buys Strategy: {e}", exc_info=True)
 
-    # ── Generate Excel + send email ───────────────────────────────────────────
-    run_summary_excel: Path | None = None
-    run_summary_http: int | None = None
+    now_utc = datetime.now(timezone.utc)
+    want_digest = should_send_daily_digest(now_utc) and not pdf_export
+    alert_http: int | None = None
+    digest_http: int | None = None
 
     if politician_portfolios and cb_strategy is not None:
-        subject_prefix = "ALERT: Position Change" if any_changes else "Portfolio Summary"
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d at %H:%M UTC")
+        date_iso = now_utc.strftime("%Y-%m-%d")
 
-        step("GENERATING EXCEL REPORT (3 sheets)")
-        excel_path = SNAPSHOT_DIR / "congress_portfolio_report.xlsx"
-        excel_ok   = generate_excel_report(politician_portfolios, cb_strategy, excel_path)
+        if pdf_export:
+            step("GENERATING PDFs (--pdf-only, no email)")
+            try:
+                build_full_portfolio_pdf(
+                    politician_portfolios, POLITICIAN_META, cb_strategy, PDF_FULL_PATH
+                )
+                sz = PDF_FULL_PATH.stat().st_size // 1024
+                substep(f"Full PDF saved → {PDF_FULL_PATH.resolve()} ({sz} KB)")
+            except Exception as e:
+                print(f"    ❌ PDF (full) generation failed: {e}")
+                logger.error(f"PDF full error: {e}", exc_info=True)
+            try:
+                export_sections = change_sections_export
+                if not export_sections:
+                    export_sections = [
+                        (
+                            "Status",
+                            [
+                                {
+                                    "ticker": "—",
+                                    "type": "No changes detected vs prior snapshot",
+                                    "date": None,
+                                    "old_pct": 0.0,
+                                    "new_pct": 0.0,
+                                    "value": None,
+                                }
+                            ],
+                        )
+                    ]
+                build_changes_pdf(export_sections, PDF_CHANGES_PATH)
+                szc = PDF_CHANGES_PATH.stat().st_size // 1024
+                substep(f"Changes PDF saved → {PDF_CHANGES_PATH.resolve()} ({szc} KB)")
+            except Exception as e:
+                print(f"    ❌ PDF (changes) generation failed: {e}")
+                logger.error(f"PDF changes error: {e}", exc_info=True)
 
-        if excel_ok:
-            run_summary_excel = excel_path
-            step("SENDING EMAIL WITH EXCEL ATTACHMENT")
-            if any_changes:
-                print("    Position/strategy changes detected — sending ALERT email.")
+        elif any_alert and change_sections:
+            step("GENERATING CHANGES-ONLY PDF")
+            try:
+                build_changes_pdf(change_sections, PDF_CHANGES_PATH)
+                sz = PDF_CHANGES_PATH.stat().st_size // 1024
+                substep(f"Changes PDF saved → {PDF_CHANGES_PATH.resolve()} ({sz} KB)")
+            except Exception as e:
+                print(f"    ❌ PDF (changes) generation failed: {e}")
+                logger.error(f"PDF changes error: {e}", exc_info=True)
             else:
-                print("    No changes — sending full PORTFOLIO SUMMARY email.")
-            run_summary_http = send_email_sendgrid(subject_prefix, excel_path)
-        else:
-            print("    ⚠  Excel generation failed — email not sent.")
+                step("SENDING ALERT EMAIL (PDF: changes only)")
+                bullets = "".join(
+                    f"<li><strong>{name}</strong>: {len(rows)} row(s)</li>"
+                    for name, rows in change_sections
+                )
+                inner = f"""      <p style="font-size:16px;color:#333;margin-top:0">
+        Generated on <strong>{now_str}</strong>.
+      </p>
+      <p style="font-size:15px;color:#555">
+        Open the <strong>attached PDF</strong> for <strong>modified positions and strategy weights only</strong>.
+      </p>
+      <ul style="color:#555;font-size:15px;line-height:2">{bullets}</ul>"""
+                subject = f"ALERT: Position or strategy change — Congress Portfolio — {date_iso}"
+                alert_http = send_email_sendgrid_pdf(
+                    subject, _html_email_shell("ALERT: Position or strategy change", inner), PDF_CHANGES_PATH
+                )
 
-    if run_summary_excel is not None and run_summary_excel.exists():
-        sz = run_summary_excel.stat().st_size
-        print("\n--- Run summary ---")
-        print(f"Report file: {run_summary_excel.resolve()}")
-        print(f"File size: {sz} bytes ({sz // 1024} KB)")
-        if run_summary_http is not None:
-            print(f"SendGrid email: HTTP {run_summary_http}")
-        else:
-            print("SendGrid email: (not sent or failed; see log above)")
+        if want_digest:
+            step("GENERATING FULL PORTFOLIO PDF (daily digest)")
+            try:
+                build_full_portfolio_pdf(
+                    politician_portfolios, POLITICIAN_META, cb_strategy, PDF_FULL_PATH
+                )
+                sz = PDF_FULL_PATH.stat().st_size // 1024
+                substep(f"Full PDF saved → {PDF_FULL_PATH.resolve()} ({sz} KB)")
+            except Exception as e:
+                print(f"    ❌ PDF (full) generation failed: {e}")
+                logger.error(f"PDF full error: {e}", exc_info=True)
+            else:
+                step("SENDING DAILY DIGEST EMAIL (PDF: full portfolio)")
+                pol_lines = "".join(
+                    f"<li><strong>{n}</strong> — individual stock portfolio</li>" for n in POLITICIANS
+                )
+                inner = f"""      <p style="font-size:16px;color:#333;margin-top:0">
+        Generated on <strong>{now_str}</strong>.
+      </p>
+      <p style="font-size:15px;color:#555">
+        Open the <strong>attached PDF</strong> for the <strong>full report</strong> (all tracked politicians and Congress Buys strategy).
+      </p>
+      <ul style="color:#555;font-size:15px;line-height:2">{pol_lines}
+        <li><strong>Congress Buys Strategy</strong> — weighted by purchase volume</li>
+      </ul>"""
+                subject = f"Daily portfolio summary — Congress Portfolio — {date_iso}"
+                digest_http = send_email_sendgrid_pdf(
+                    subject, _html_email_shell("Daily portfolio summary", inner), PDF_FULL_PATH
+                )
+                if digest_http in (200, 202):
+                    mark_digest_sent(date_iso)
+                    substep(f"Digest date recorded → {LAST_DIGEST_PATH.name}")
+                else:
+                    print("    ⚠  Digest email not confirmed sent — last_digest_date not updated.")
+
+        elif not pdf_export and not any_alert and not want_digest:
+            substep("No alert (no qualifying changes) and digest not due this run — no emails sent.")
+
+    print("\n--- Run summary ---")
+    if PDF_CHANGES_PATH.exists():
+        print(f"Changes PDF: {PDF_CHANGES_PATH.resolve()} ({PDF_CHANGES_PATH.stat().st_size // 1024} KB)")
     else:
-        print("\n--- Run summary ---")
-        print("Report file: (no Excel written this run)")
-        print("SendGrid email: n/a")
+        print("Changes PDF: (not written this run)")
+    if PDF_FULL_PATH.exists():
+        print(f"Full PDF:    {PDF_FULL_PATH.resolve()} ({PDF_FULL_PATH.stat().st_size // 1024} KB)")
+    else:
+        print("Full PDF:    (not written this run)")
+    print(f"Alert email:  HTTP {alert_http}" if alert_http is not None else "Alert email:  (not sent)")
+    print(f"Digest email: HTTP {digest_http}" if digest_http is not None else "Digest email: (not sent)")
 
     print("\n" + "█" * 60)
     print("  PORTFOLIO CHECK COMPLETE")
@@ -792,10 +745,11 @@ def run_portfolio_check():
     sys.exit(0)
 
 
-def run_weekly_summary():
+def run_daily_digest():
+    """Standalone digest: refresh snapshots, full PDF, one digest email. Use with e.g. cron ``0 8 * * *``."""
     _STEP_COUNTER[0] = 0
     print("\n" + "█" * 60)
-    print("  WEEKLY PORTFOLIO SUMMARY RUN — STARTING")
+    print("  DAILY DIGEST RUN — STARTING")
     print("  " + datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"))
     print("█" * 60)
 
@@ -808,6 +762,9 @@ def run_weekly_summary():
             trades    = fetch_trades(politician)
             print("    Reconstructing portfolio...")
             portfolio = reconstruct_portfolio(trades)
+            if portfolio.empty:
+                print(f"    ⚠  No open positions for {politician} — skipping.")
+                continue
             substep(f"{len(portfolio)} open positions")
             politician_portfolios[politician] = portfolio
             print("    Saving snapshot...")
@@ -830,25 +787,62 @@ def run_weekly_summary():
         logger.error(f"Error processing Congress Buys Strategy: {e}", exc_info=True)
 
     if politician_portfolios and cb_strategy is not None:
-        step("GENERATING EXCEL REPORT (3 sheets)")
-        excel_path = SNAPSHOT_DIR / "congress_portfolio_report.xlsx"
-        excel_ok   = generate_excel_report(politician_portfolios, cb_strategy, excel_path)
-
-        if excel_ok:
-            step("SENDING EMAIL WITH EXCEL ATTACHMENT")
-            send_email_sendgrid("Weekly Portfolio Summary", excel_path)
+        step("GENERATING FULL PORTFOLIO PDF")
+        try:
+            build_full_portfolio_pdf(
+                politician_portfolios, POLITICIAN_META, cb_strategy, PDF_FULL_PATH
+            )
+            print(f"    ✅ Full PDF → {PDF_FULL_PATH.resolve()}")
+        except Exception as e:
+            print(f"    ❌ PDF generation failed: {e}")
+            logger.error(f"PDF full error: {e}", exc_info=True)
         else:
-            print("    ⚠  Excel generation failed — email not sent.")
+            step("SENDING DAILY DIGEST EMAIL")
+            now_utc = datetime.now(timezone.utc)
+            now_str = now_utc.strftime("%Y-%m-%d at %H:%M UTC")
+            date_iso = now_utc.strftime("%Y-%m-%d")
+            pol_lines = "".join(
+                f"<li><strong>{n}</strong> — individual stock portfolio</li>" for n in POLITICIANS
+            )
+            inner = f"""      <p style="font-size:16px;color:#333;margin-top:0">
+        Generated on <strong>{now_str}</strong>.
+      </p>
+      <p style="font-size:15px;color:#555">
+        Open the <strong>attached PDF</strong> for the <strong>full report</strong>.
+      </p>
+      <ul style="color:#555;font-size:15px;line-height:2">{pol_lines}
+        <li><strong>Congress Buys Strategy</strong> — weighted by purchase volume</li>
+      </ul>"""
+            subject = f"Daily portfolio summary — Congress Portfolio — {date_iso}"
+            st = send_email_sendgrid_pdf(
+                subject, _html_email_shell("Daily portfolio summary", inner), PDF_FULL_PATH
+            )
+            if st in (200, 202):
+                mark_digest_sent(date_iso)
 
     print("\n" + "█" * 60)
-    print("  WEEKLY SUMMARY COMPLETE")
+    print("  DAILY DIGEST COMPLETE")
     print("  " + datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"))
     print("█" * 60 + "\n")
     sys.exit(0)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--summary":
-        run_weekly_summary()
+    args = sys.argv[1:]
+    reset = "--reset-snapshots" in args
+    pdf_only = "--pdf-only" in args
+
+    if "--digest" in args or "--summary" in args:
+        if reset:
+            print("\n  ⚠  --reset-snapshots is ignored when used with --digest / --summary.\n")
+        run_daily_digest()
+    elif reset:
+        print("\n" + "=" * 60)
+        print("  RESET SNAPSHOTS — archive + delete JSON baselines (then PDF export)")
+        print("=" * 60)
+        archive_and_remove_snapshots()
+        run_portfolio_check(pdf_export=True)
+    elif pdf_only:
+        run_portfolio_check(pdf_export=True)
     else:
         run_portfolio_check()
